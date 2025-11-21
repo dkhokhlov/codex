@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use anyhow::Context;
 use core_test_support::test_codex_exec::test_codex_exec;
+use predicates::str::contains;
 use serde_json::Value;
 use std::path::Path;
 use std::string::ToString;
@@ -174,6 +175,25 @@ fn exec_resume_last_accepts_prompt_after_flag_in_json_mode() -> anyhow::Result<(
     let content = std::fs::read_to_string(&resumed_path)?;
     assert!(content.contains(&marker));
     assert!(content.contains(&marker2));
+    Ok(())
+}
+
+#[test]
+fn exec_resume_last_conflicts_with_session_id() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    let session_id = Uuid::new_v4().to_string();
+
+    test.cmd()
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .arg("resume")
+        .arg(&session_id)
+        .arg("--last")
+        .assert()
+        .failure()
+        .stderr(contains("cannot be used with '--last"));
+
     Ok(())
 }
 
