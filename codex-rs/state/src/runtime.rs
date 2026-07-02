@@ -363,10 +363,96 @@ fn base_sqlite_options(path: &Path) -> SqliteConnectOptions {
     SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal)
+        .journal_mode(journal_mode_for_path(path))
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(Duration::from_secs(5))
         .log_statements(LevelFilter::Off)
+}
+
+/// Choose a SQLite journal mode that is safe for the filesystem holding `path`.
+///
+/// WAL mode coordinates readers and writers through a mmap'd `*-shm`
+/// shared-memory index. mmap is not kept coherent across NFS clients, so a WAL
+/// checkpoint can write wrong data back to the database and corrupt the header
+/// on a network filesystem. SQLite documents that WAL should not be used on
+/// network filesystems (https://www.sqlite.org/wal.html, "Use of WAL with
+/// Network Filesystems").
+///
+/// Rollback journal modes keep all reader/writer coordination in fcntl
+/// byte-range locks and a plain journal file — no shared mmap — so they are
+/// NFS-safe. `Truncate` is preferred over `Delete` (and over `Persist`, which
+/// keeps a journal file of fixed size but still rolls back via locks) on NFS
+/// because it amortizes journal-file creation: a single create plus a `truncate`
+/// to zero length per commit instead of create+unlink on every transaction,
+/// reducing metadata round-trips to the server. On local filesystems mmap is
+/// coherent, so `Wal` stays the fast default.
+///
+/// Detection via `statfs(2)` covers Linux and macOS only. Known limitations:
+///   - A container overlay whose `upperdir` is on an NFS-backed volume reports
+///     the overlay magic, not NFS, so WAL is kept there.
+///   - Windows SMB/UNC shares have the same mmap-coherence problem but are not
+///     detected; the catch-all assumes a local filesystem.
+///   - BSDs also have `statfs` + an NFS flag but are not handled here.
+fn journal_mode_for_path(path: &Path) -> SqliteJournalMode {
+    let on_nfs = path_is_on_nfs(path);
+    if on_nfs {
+        log::warn!(
+            "CODEX_HOME on NFS detected at {}; using TRUNCATE journal mode (WAL is unsafe on network filesystems)",
+            path.display()
+        );
+    }
+    pick_journal_mode(on_nfs)
+}
+
+fn pick_journal_mode(is_nfs: bool) -> SqliteJournalMode {
+    if is_nfs {
+        SqliteJournalMode::Truncate
+    } else {
+        SqliteJournalMode::Wal
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn path_is_on_nfs(path: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // The database file may not exist yet on first open (create_if_missing),
+    // and statfs needs an existing path, so inspect the parent directory. A
+    // path with no parent (e.g. a bare filename) is resolved against the
+    // current directory rather than probing the filename itself.
+    let target = path.parent().unwrap_or_else(|| Path::new("."));
+    let bytes = target.as_os_str().as_bytes();
+    let Ok(c_path) = CString::new(bytes) else {
+        // Path contains an interior NUL, which statfs cannot accept. Bias
+        // toward the NFS-safe mode, consistent with the statfs-error branch.
+        return true;
+    };
+    // SAFETY: statfs fills a plain struct of integers from a valid C string
+    // path. The buffer is zero-initialized so any padding is deterministic.
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut buf) } != 0 {
+        // statfs failed on an unknown mount: bias toward the NFS-safe mode
+        // rather than silently keeping WAL, which is the corruption we prevent.
+        return true;
+    }
+    is_nfs_statfs(&buf)
+}
+
+#[cfg(target_os = "linux")]
+fn is_nfs_statfs(buf: &libc::statfs) -> bool {
+    buf.f_type == libc::NFS_SUPER_MAGIC
+}
+
+#[cfg(target_os = "macos")]
+fn is_nfs_statfs(buf: &libc::statfs) -> bool {
+    (buf.f_flags & libc::MNT_NFS) != 0
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn path_is_on_nfs(_path: &Path) -> bool {
+    // No portable statfs available; assume a local filesystem and keep WAL.
+    false
 }
 
 async fn open_state_sqlite(
@@ -551,10 +637,44 @@ mod tests {
     use sqlx::SqlitePool;
     use sqlx::migrate::MigrateError;
     use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::sqlite::SqliteJournalMode;
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
     use std::path::Path;
     use std::sync::Mutex;
+
+    #[test]
+    fn pick_journal_mode_uses_truncate_on_nfs() {
+        assert_eq!(super::pick_journal_mode(true), SqliteJournalMode::Truncate);
+    }
+
+    #[test]
+    fn pick_journal_mode_uses_wal_on_local_filesystem() {
+        assert_eq!(super::pick_journal_mode(false), SqliteJournalMode::Wal);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn is_nfs_statfs_detects_nfs_magic() {
+        let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+        buf.f_type = libc::NFS_SUPER_MAGIC;
+        assert!(super::is_nfs_statfs(&buf));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn path_is_on_nfs_false_for_local_tmpdir() {
+        assert!(!super::path_is_on_nfs(&std::env::temp_dir()));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn path_is_on_nfs_uses_parent_when_file_absent() {
+        // A not-yet-created DB file is classified by its parent (temp_dir),
+        // which is local on CI, so the result is false rather than an error.
+        let p = std::env::temp_dir().join("definitely_not_present_codex_review.sqlite");
+        assert!(!super::path_is_on_nfs(&p));
+    }
 
     #[derive(Default)]
     struct TestTelemetry {
